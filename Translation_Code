@@ -1,0 +1,158 @@
+!pip install deep-translator indic-transliteration langdetect chardet
+import pandas as pd
+from deep_translator import GoogleTranslator, MyMemoryTranslator
+from indic_transliteration import sanscript
+from indic_transliteration.sanscript import transliterate
+import re
+import chardet
+import time
+
+# -------- CONFIG --------
+INPUT_FILE = "input.csv"
+OUTPUT_FILE = "output_translated.csv"
+
+BATCH_SIZE = 40              # ✅ paragraph-safe
+DELAY_BETWEEN_BATCH = 1.0   # ✅ Google-safe
+# ------------------------
+
+# -------------------------------------------------
+# Dynamic CSV reader (encoding-safe)
+# -------------------------------------------------
+def read_csv_dynamic(file_path):
+    with open(file_path, "rb") as f:
+        raw = f.read(100000)
+        encoding = chardet.detect(raw)["encoding"]
+    print(f"✅ Detected encoding: {encoding}")
+    try:
+        return pd.read_csv(file_path, encoding=encoding)
+    except:
+        return pd.read_csv(file_path, encoding="latin-1")
+
+df = read_csv_dynamic(INPUT_FILE)
+
+# -------------------------------------------------
+def is_empty(val):
+    return pd.isna(val) or str(val).strip() == ""
+
+# -------------------------------------------------
+# Extract language from header (STRUCTURAL)
+# -------------------------------------------------
+def extract_lang_from_header(header):
+    matches = re.findall(r'(?<![a-z])[a-z]{2}(?![a-z])', str(header).lower())
+    return matches[-1] if matches else None
+
+# -------------------------------------------------
+# Transliteration (paragraph-safe)
+# -------------------------------------------------
+LANG_TO_SCRIPT = {
+    "hi": sanscript.DEVANAGARI,
+    "mr": sanscript.DEVANAGARI,
+    "bn": sanscript.BENGALI,
+    "ta": sanscript.TAMIL,
+    "te": sanscript.TELUGU,
+    "kn": sanscript.KANNADA,
+    "ml": sanscript.MALAYALAM,
+    "gu": sanscript.GUJARATI,
+    "pa": sanscript.GURMUKHI,
+    "or": sanscript.ORIYA,
+    "as": sanscript.BENGALI
+}
+
+def transliterate_paragraph(text, lang):
+    """
+    Preserves newlines, bullet points, paragraphs
+    """
+    script = LANG_TO_SCRIPT.get(lang)
+    if not script:
+        return text
+
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        try:
+            out.append(transliterate(line, sanscript.ITRANS, script))
+        except:
+            out.append(line)
+    return "\n".join(out)
+
+# -------------------------------------------------
+# Detect column languages
+# -------------------------------------------------
+column_lang_map = {}
+for col_idx, col_name in enumerate(df.columns):
+    column_lang_map[col_idx] = extract_lang_from_header(col_name)
+
+EN_COL_INDEX = next((i for i, l in column_lang_map.items() if l == "en"), None)
+if EN_COL_INDEX is None:
+    raise Exception("❌ English column not found")
+
+english_series = df.iloc[:, EN_COL_INDEX].astype(str)
+
+print("\n✅ Column Language Mapping:")
+for i, l in column_lang_map.items():
+    print(f"{df.columns[i]} → {l}")
+
+# -------------------------------------------------
+# Translation with FULL fallback chain
+# -------------------------------------------------
+def translate_batch_with_fallback(texts, lang):
+    """
+    1️⃣ Google
+    2️⃣ MyMemory
+    3️⃣ Transliteration
+    """
+
+    # --- Google ---
+    try:
+        google = GoogleTranslator(source="en", target=lang)
+        result = google.translate_batch(texts)
+        if result and all(r and r.strip() for r in result):
+            return result
+    except:
+        pass
+
+    # --- MyMemory ---
+    try:
+        memory = MyMemoryTranslator(source="en", target=lang)
+        result = memory.translate_batch(texts)
+        if result and all(r and r.strip() for r in result):
+            return result
+    except:
+        pass
+
+    # --- Transliteration ---
+    return [transliterate_paragraph(t, lang) for t in texts]
+
+# -------------------------------------------------
+# Batch translation per language
+# -------------------------------------------------
+for col_idx, lang in column_lang_map.items():
+    if col_idx == EN_COL_INDEX or not lang or lang == "en":
+        continue
+
+    print(f"\n🔄 Translating language: {lang}")
+    target_col = df.columns[col_idx]
+
+    rows_to_translate = [
+        i for i in range(len(df))
+        if not is_empty(english_series[i]) and is_empty(df.iloc[i, col_idx])
+    ]
+
+    for i in range(0, len(rows_to_translate), BATCH_SIZE):
+        batch_rows = rows_to_translate[i:i+BATCH_SIZE]
+        batch_texts = [english_series[r] for r in batch_rows]
+
+        translated_texts = translate_batch_with_fallback(batch_texts, lang)
+
+        for r, t in zip(batch_rows, translated_texts):
+            df.iloc[r, col_idx] = t
+
+        print(f"✅ {lang}: {min(i+BATCH_SIZE, len(rows_to_translate))}/{len(rows_to_translate)}")
+        time.sleep(DELAY_BETWEEN_BATCH)
+
+# -------------------------------------------------
+# Save output
+# -------------------------------------------------
+df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+
+print("\n✅ ✅ FINAL: Translation completed (paragraph-safe, no empty cells)")
